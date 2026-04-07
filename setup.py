@@ -1,7 +1,14 @@
+import os
 from setuptools import setup, find_packages
 
-setup(name='ampliclip',
-    version=__version__,
+version_dict = {}
+version_path = os.path.join(os.path.dirname(__file__), 'ampliclip', 'version.py')
+with open(version_path, 'r') as f:
+    exec(f.read(), version_dict)
+
+setup(
+    name='ampliclip',
+    version=version_dict['__version__'],
     packages=find_packages(),
     entry_points={
         'console_scripts': [
@@ -17,4 +24,5 @@ setup(name='ampliclip',
     author='David F. Nieuwenhuijse',
     author_email='d.nieuwenhuijse@erasmusmc.nl',
     license='BSD 3-Clause',
-    zip_safe=False)
+    zip_safe=False
+)
