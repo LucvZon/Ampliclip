@@ -39,4 +39,6 @@ optional arguments:
   -m MISMATCH, --mismatch MISMATCH
                         Number of mismatches allowed while matching and
                         determining the position of the primers
+  -t THREADS, --threads
+                        Number of threads for BAM I/O
 ```
