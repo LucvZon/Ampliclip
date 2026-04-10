@@ -98,6 +98,8 @@ parser.add_argument(
         version=f"%(prog)s {__version__}"
     )
 
+parser.add_argument('-t', '--threads', help='Number of threads for BAM I/O', default=1, type=int)
+
 class Region(object):
     """Primer alignment region class"""
     def __init__(self, start, end, strand, primer_id):
@@ -137,66 +139,75 @@ def clip_read(read, n_clip, side):
     X   BAM_CDIFF   8 (not handled)
     B   BAM_CBACK   9 (not handled)
     '''
-    
-    #If all aligned bases are clipped completely clip cigarstring
+    # If all aligned bases are clipped completely clip cigarstring
     if read.qlen <= n_clip:
-        read.cigartuples = [(4,read.query_length)]
+        read.cigartuples = [(4, read.query_length)]
         return
 
     current_cigar = read.cigartuples
-    #Reverse cigar if we have to clip the right side
     if side == "right":
         current_cigar.reverse()
 
-    #Expand cigarstring
-    cigar_expanded = ''.join([j*str(i) for i,j in current_cigar])
-
-    #Clip cigar until no more "clip" left:
-    clip_leftover = n_clip
-    n = 0
-    cigar_replacement = ''
-    while clip_leftover > 0:
-        cig = int(cigar_expanded[n])
-        if cig == 0:
-            cigar_replacement += "4" #Replace matches with softclipped base
-            clip_leftover -= 1
-        elif cig == 1:
-            cigar_replacement += "4" #Replace insertions with softclipped base
-        elif cig == 2:
-            n_clip += 1 #Increase n_clip to increase reference_start shift at the end in case of deletions
-        elif cig == 4:
-            cigar_replacement += "4" #Do not replace softclipped
-        elif cig == 5:
-            cigar_replacement += "5" #Do not replace hardclipped
-        else:
-            raise ValueError("Something went wrong: do not know how to clip " + str(cig) + " in cigarstring")
-        n += 1
-
-    cigar_expanded = cigar_replacement + cigar_expanded[n:]
-
-    #Recreate tuples:
     clipped_cigar = []
-    c = 0
-    nprev=cigar_expanded[0]
-    for n in cigar_expanded:
-        if n==nprev:
-            c+=1
+    clip_leftover = n_clip
+    softclips_to_add = 0
+    ref_shift = 0  # To track deletions for reference_start shifting
+
+    for op, length in current_cigar:
+        if clip_leftover > 0:
+            if op == 4:  # Soft clip (Does not consume reference)
+                softclips_to_add += length
+            elif op == 5:  # Hard clip
+                if softclips_to_add > 0:
+                    clipped_cigar.append((4, softclips_to_add))
+                    softclips_to_add = 0
+                clipped_cigar.append((op, length))
+            elif op == 1:  # Insertion (Does not consume reference)
+                softclips_to_add += length
+            elif op == 2:  # Deletion (Consumes reference, but not query)
+                ref_shift += length
+            elif op == 0:  # Match
+                if length <= clip_leftover:
+                    softclips_to_add += length
+                    clip_leftover -= length
+                else:
+                    softclips_to_add += clip_leftover
+                    clipped_cigar.append((4, softclips_to_add))
+                    softclips_to_add = 0
+                    
+                    clipped_cigar.append((0, length - clip_leftover))
+                    clip_leftover = 0
+            else:
+                raise ValueError("Something went wrong: do not know how to clip " + str(op) + " in cigarstring")
         else:
-            clipped_cigar.append((int(nprev),c))
-            c=1
-            nprev=n
-    clipped_cigar.append((int(n),c))
+            # clip_leftover is exhausted, flush any pending softclips immediately
+            if softclips_to_add > 0:
+                clipped_cigar.append((4, softclips_to_add))
+                softclips_to_add = 0
+            clipped_cigar.append((op, length))
 
-    #Un-reverse cigar if clipped on right side
+    # Flush any lingering softclips at the very end
+    if softclips_to_add > 0:
+        clipped_cigar.append((4, softclips_to_add))
+
+    # Merge consecutive identical operations to keep CIGAR valid (e.g., 5S followed by 10S becomes 15S)
+    merged_cigar = []
+    for op, length in clipped_cigar:
+        if length == 0:
+            continue
+        if merged_cigar and merged_cigar[-1][0] == op:
+            merged_cigar[-1] = (op, merged_cigar[-1][1] + length)
+        else:
+            merged_cigar.append((op, length))
+
     if side == 'right':
-        clipped_cigar.reverse()
+        merged_cigar.reverse()
 
-    #Replace cigar tuples of the read
-    read.cigartuples = clipped_cigar
+    read.cigartuples = merged_cigar
 
-    #Shift alignment start if clipped to the right
     if side == 'left':
-        read.reference_start = read.reference_start + n_clip
+        # Shift reference start by the number of clipped bases + any deletions we passed
+        read.reference_start = read.reference_start + n_clip + ref_shift
 
 def trim_read(args, read):
     '''
@@ -373,8 +384,10 @@ def main():
 
     logging.info("Trimming primers...")
 
-    with pysam.AlignmentFile(args.infile, "rb") as infile, pysam.AlignmentFile(args.outfile, "wb", header=infile.header) as outfile, open(args.outfastq, "w") as outfastq:
-        for read in infile.fetch():
+    with pysam.AlignmentFile(args.infile, "rb", threads=args.threads) as infile, \
+         pysam.AlignmentFile(args.outfile, "wb", header=infile.header, threads=args.threads) as outfile, \
+         open(args.outfastq, "w") as outfastq:
+        for read in infile:
             if read.is_unmapped | read.is_secondary | read.is_supplementary:
                 continue
             
@@ -383,6 +396,8 @@ def main():
             read_was_clipped = False
 
             for region in trim_regions:
+                if read.reference_end < region.start - args.padding or read.reference_start > region.end + args.padding:
+                    continue
                 
                 overlap = calculate_overlap(read, region, padding=args.padding)
                 if overlap > 0:
